@@ -1,0 +1,7 @@
+metadrive-simulator
+pygame
+opencv-python-headless
+torch
+transformers
+huggingface_hub
+sentencepiece

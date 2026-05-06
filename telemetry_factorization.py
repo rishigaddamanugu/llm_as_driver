@@ -20,6 +20,7 @@ class TelemetryFactors:
 
 
 def neutral_inference_telemetry_factors() -> TelemetryFactors:
+    """Unknown human oracle for o_{t+1}: all categorical slots map to ``__UNK__``."""
     return TelemetryFactors(
         speed=_UNK,
         longitudinal=_UNK,

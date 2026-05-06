@@ -41,8 +41,8 @@ def write_rollout_human_readable_text_files(
     with raw_text_path.open("w", encoding="utf-8") as raw_file:
         raw_file.write(
             "# RAW ROLLOUT (parallel arrays, one timestep per block).\n"
-            "# For index i: expert_observations[i], expert_actions[i], "
-            "# telemetry_labels_T_at_same_timestep_as_observation[i] == T(observation_i).\n\n"
+            "# Index i logs expert_observations[i], expert_actions[i], and the label string at step i.\n"
+            "# Training uses (o_t, label[t+1], a_t): label index t+1 is the oracle T(obs_{t+1}).\n\n"
         )
         for time_index in range(number_of_timesteps):
             steer = float(expert_actions[time_index, 0])
@@ -119,8 +119,8 @@ def write_rollout_human_readable_text_files(
 def _raw_header() -> str:
     return (
         "# RAW ROLLOUT (parallel arrays, one timestep per block).\n"
-        "# For index i: expert_observations[i], expert_actions[i], "
-        "# telemetry_labels_T_at_same_timestep_as_observation[i] == T(observation_i).\n\n"
+        "# Index i logs expert_observations[i], expert_actions[i], and the label string at step i.\n"
+        "# Training pairs (o_t, label[t+1], a_t) — oracle for the next observation.\n\n"
     )
 
 
@@ -297,11 +297,10 @@ def save_rollout_npz(
         "expert_actions": expert_actions,
         "telemetry_labels_T_at_same_timestep_as_observation": telemetry_labels_T_at_same_timestep_as_observation,
         "dataset_schema_description": np.array(
-            "parallel rows: expert_observations[i], expert_actions[i], "
-            "telemetry_labels_T_at_same_timestep_as_observation[i] equals T(observation_i). "
-            "offset training rows: observation_input_time_t[t] = expert_observations[t], "
-            "telemetry_label_T_observation_time_t_plus_one[t] = T(observation_{t+1}), "
-            "expert_action_target_time_t[t] = expert_actions[t]",
+            "parallel log index i: observations[i], actions[i], label string at step i. "
+            "Supervision (offset rows): observation_input_time_t[t]=o_t, "
+            "telemetry_label_T_observation_time_t_plus_one[t]=T(obs_{t+1}), "
+            "expert_action_target_time_t[t]=a_t",
             dtype=object,
         ),
     }

@@ -7,6 +7,7 @@ import os
 import random
 import sys
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
@@ -173,6 +174,57 @@ class DistillMLP(nn.Module):
         return self.net(x)
 
 
+UNK_TELEMETRY_TOKEN = "__UNK__"
+
+
+def _token_id_for_string(vocab_tokens: np.ndarray, token: str) -> int:
+    flat = np.asarray(vocab_tokens, dtype=object).reshape(-1)
+    for i in range(int(flat.shape[0])):
+        if str(flat[i]).strip() == token:
+            return int(i)
+    return 0
+
+
+def _telemetry_unk_ids_from_npz(data: Any) -> dict[str, int]:
+    speed_va = np.asarray(data["telemetry_speed_vocab"], dtype=object)
+    long_va = np.asarray(data["telemetry_longitudinal_vocab"], dtype=object)
+    steer_va = np.asarray(data["telemetry_steering_vocab"], dtype=object)
+    route_va = np.asarray(data["telemetry_route_bin_vocab"], dtype=object)
+    return {
+        "speed_id": _token_id_for_string(speed_va, UNK_TELEMETRY_TOKEN),
+        "longitudinal_id": _token_id_for_string(long_va, UNK_TELEMETRY_TOKEN),
+        "steering_id": _token_id_for_string(steer_va, UNK_TELEMETRY_TOKEN),
+        "route_bin_id": _token_id_for_string(route_va, UNK_TELEMETRY_TOKEN),
+    }
+
+
+def _duplicate_neutral_telemetry_rows(
+    obs: np.ndarray,
+    telemetry_fields: dict[str, np.ndarray],
+    targets: np.ndarray,
+    unk_ids: dict[str, int],
+) -> tuple[np.ndarray, dict[str, np.ndarray], np.ndarray]:
+    """Append a copy of each row with neutral __UNK__ for T(obs_{t+1}) (same o_t and a_t targets)."""
+    n = int(obs.shape[0])
+    neutral_speed = np.full(n, unk_ids["speed_id"], dtype=np.int64)
+    neutral_long = np.full(n, unk_ids["longitudinal_id"], dtype=np.int64)
+    neutral_steer = np.full(n, unk_ids["steering_id"], dtype=np.int64)
+    neutral_route = np.full(n, unk_ids["route_bin_id"], dtype=np.int64)
+    neutral_overspeed = np.zeros(n, dtype=np.float32)
+    neutral_off_lane = np.zeros(n, dtype=np.float32)
+    tf_out: dict[str, np.ndarray] = {
+        "speed_id": np.concatenate([telemetry_fields["speed_id"], neutral_speed]),
+        "longitudinal_id": np.concatenate([telemetry_fields["longitudinal_id"], neutral_long]),
+        "steering_id": np.concatenate([telemetry_fields["steering_id"], neutral_steer]),
+        "route_bin_id": np.concatenate([telemetry_fields["route_bin_id"], neutral_route]),
+        "overspeed": np.concatenate([telemetry_fields["overspeed"], neutral_overspeed]),
+        "off_lane": np.concatenate([telemetry_fields["off_lane"], neutral_off_lane]),
+    }
+    obs_aug = np.concatenate([obs, obs], axis=0)
+    targets_aug = np.concatenate([targets, targets], axis=0)
+    return obs_aug, tf_out, targets_aug
+
+
 def _load_train_ready(path: Path) -> tuple[np.ndarray, dict[str, np.ndarray], np.ndarray, dict[str, int]]:
     with np.load(path, allow_pickle=True) as data:
         obs = np.asarray(data["observation_input_time_t"], dtype=np.float32)
@@ -266,11 +318,19 @@ def _print_train_ready_meta(path: Path) -> None:
     try:
         with np.load(path, allow_pickle=True) as z:
             if "telemetry_align_mode" in z.files:
-                v = np.asarray(z["telemetry_align_mode"]).reshape(-1)[0]
-                print(f"train_ready telemetry_align_mode={v!s}", flush=True)
+                v = str(np.asarray(z["telemetry_align_mode"]).reshape(-1)[0])
+                print(f"train_ready telemetry_align_mode={v}", flush=True)
+                if v.strip().lower() in ("same", "aligned", "same_timestep"):
+                    raise RuntimeError(
+                        f"train_ready.npz reports deprecated telemetry_align_mode={v!r}. "
+                        "Regenerate with `python prepare_training_data.py` "
+                        "(only o_t + T(obs_{{t+1}}) → a_t is supported)."
+                    )
             if "dataset_schema_description" in z.files:
                 d = np.asarray(z["dataset_schema_description"]).reshape(-1)[0]
                 print(f"train_ready schema: {d!s}", flush=True)
+    except RuntimeError:
+        raise
     except Exception:
         pass
 
@@ -323,6 +383,21 @@ def main() -> None:
 
     _set_seed(seed)
     obs, telemetry_fields, targets, vocab_sizes = _load_train_ready(data_path)
+    dup_neutral = _bool_env("METADRIVE_DISTILL_DUP_NEUTRAL_TELEMETRY", True)
+    if dup_neutral:
+        with np.load(data_path, allow_pickle=True) as z:
+            unk_ids = _telemetry_unk_ids_from_npz(z)
+        obs, telemetry_fields, targets = _duplicate_neutral_telemetry_rows(
+            obs, telemetry_fields, targets, unk_ids
+        )
+        print(
+            "Training augmentation: duplicated each row with neutral "
+            f"{UNK_TELEMETRY_TOKEN!r} as unknown future-obs oracle T(obs_{{t+1}}) "
+            "(matches inference when next obs is unknown). "
+            "Set METADRIVE_DISTILL_DUP_NEUTRAL_TELEMETRY=0 to disable.",
+            flush=True,
+        )
+
     n, obs_dim = int(obs.shape[0]), int(obs.shape[1])
     if n < 2:
         raise ValueError(f"Need at least 2 training rows, got {n}.")
@@ -537,6 +612,7 @@ def main() -> None:
     metrics = {
         "data_path": str(data_path),
         "num_rows": n,
+        "dup_neutral_telemetry": dup_neutral,
         "obs_dim": obs_dim,
         "speed_vocab_size": vocab_sizes["speed"],
         "longitudinal_vocab_size": vocab_sizes["longitudinal"],

@@ -1,5 +1,16 @@
 #!/usr/bin/env python3
 
+"""Build train_ready.npz from rollout chunks.
+
+Supervision is fixed to **future-observation oracle** telemetry only:
+
+  (observation_input_time_t = o_t, telemetry = T(obs_{t+1}), expert_action_target_time_t = a_t).
+
+The parallel-log column ``telemetry_labels_T_at_same_timestep_as_observation[i]`` is the string
+recorded at simulation index ``i``; training selects index ``t+1`` when the model input is ``o_t``.
+At inference the true ``o_{t+1}`` is unknown unless the user supplies an instruction → use ``__UNK__``.
+"""
+
 from __future__ import annotations
 
 import json
@@ -10,6 +21,27 @@ from typing import Iterable
 import numpy as np
 
 from telemetry_factorization import build_vocab, encode_with_vocab, factors_from_compact_label
+
+_TELEMETRY_ALIGN_CANONICAL = "obs_t_telem_t_plus_1"
+_LEGACY_SAME_ALIASES = frozenset({"same", "aligned", "same_timestep"})
+
+
+def _reject_legacy_align_env() -> None:
+    raw = os.environ.get("METADRIVE_TRAIN_TELEMETRY_ALIGN", "").strip()
+    if not raw:
+        return
+    lower = raw.lower()
+    if lower == _TELEMETRY_ALIGN_CANONICAL:
+        return
+    if lower in _LEGACY_SAME_ALIASES:
+        raise ValueError(
+            "METADRIVE_TRAIN_TELEMETRY_ALIGN=same (and aliases aligned|same_timestep) is invalid. "
+            "Training is only (o_t, T(obs_{t+1}), a_t). Unset METADRIVE_TRAIN_TELEMETRY_ALIGN."
+        )
+    raise ValueError(
+        f"METADRIVE_TRAIN_TELEMETRY_ALIGN={raw!r} is not supported (alignment is not configurable). "
+        f"Supervision is fixed to {_TELEMETRY_ALIGN_CANONICAL}. Unset this environment variable."
+    )
 
 
 def _sorted_chunk_paths(glob_pattern: str) -> list[Path]:
@@ -82,25 +114,6 @@ def _factorize_telemetry_labels(telemetry_labels: np.ndarray) -> dict[str, objec
     }
 
 
-def _build_aligned_training_dataset(
-    expert_observations: np.ndarray,
-    expert_actions: np.ndarray,
-    telemetry_labels_T_at_same_timestep_as_observation: np.ndarray,
-) -> dict[str, np.ndarray]:
-    n = int(expert_observations.shape[0])
-    if n < 1:
-        raise ValueError("Need at least 1 timestep.")
-    if expert_actions.shape[0] != n:
-        raise ValueError("expert_observations and expert_actions length mismatch.")
-    if telemetry_labels_T_at_same_timestep_as_observation.shape[0] != n:
-        raise ValueError("expert_observations and telemetry_labels length mismatch.")
-    return {
-        "observation_input_time_t": expert_observations.copy(),
-        "telemetry_label_same_timestep_as_observation": telemetry_labels_T_at_same_timestep_as_observation.copy(),
-        "expert_action_target_time_t": expert_actions.copy(),
-    }
-
-
 def _build_offset_training_dataset(
     expert_observations: np.ndarray,
     expert_actions: np.ndarray,
@@ -154,29 +167,19 @@ def main() -> None:
             f"{input_glob} or fallback file {single_fallback}."
         )
 
+    _reject_legacy_align_env()
+
     expert_observations, expert_actions, telemetry_labels = _concat_parallel_arrays(source_paths)
-    align = os.environ.get(
-        "METADRIVE_TRAIN_TELEMETRY_ALIGN",
-        "obs_t_telem_t_plus_1",
-    ).strip().lower()
-    if align in ("same", "aligned", "same_timestep"):
-        offset = _build_aligned_training_dataset(
-            expert_observations,
-            expert_actions,
-            telemetry_labels,
-        )
-        telemetry_selected = offset["telemetry_label_same_timestep_as_observation"]
-        schema_txt = (
-            "input: o_t + T_t (same index); target: a_t"
-        )
-    else:
-        offset = _build_offset_training_dataset(
-            expert_observations,
-            expert_actions,
-            telemetry_labels,
-        )
-        telemetry_selected = offset["telemetry_label_T_observation_time_t_plus_one"]
-        schema_txt = "input: o_t + T_{t+1}; target: a_t"
+    offset = _build_offset_training_dataset(
+        expert_observations,
+        expert_actions,
+        telemetry_labels,
+    )
+    telemetry_selected = offset["telemetry_label_T_observation_time_t_plus_one"]
+    schema_txt = (
+        "input: o_t + T(obs_{t+1}); target: a_t  "
+        "(human oracle describes the next observation; inference uses UNK without user override)"
+    )
 
     fac = _factorize_telemetry_labels(telemetry_selected)
 
@@ -198,7 +201,7 @@ def main() -> None:
         "telemetry_steering_vocab": np.asarray(fac["steering_id_to_token"], dtype=object),
         "telemetry_route_bin_vocab": np.asarray(fac["route_bin_id_to_token"], dtype=object),
         "dataset_schema_description": np.array(schema_txt, dtype=object),
-        "telemetry_align_mode": np.array(align, dtype=object),
+        "telemetry_align_mode": np.array(_TELEMETRY_ALIGN_CANONICAL, dtype=object),
     }
 
     out_npz.parent.mkdir(parents=True, exist_ok=True)
@@ -227,6 +230,10 @@ def main() -> None:
     num_train_rows = int(offset["observation_input_time_t"].shape[0])
     print(f"Wrote train dataset: {out_npz}", flush=True)
     print(f"Wrote telemetry vocab: {out_vocab}", flush=True)
+    print(
+        f"Telemetry supervision: {_TELEMETRY_ALIGN_CANONICAL} — o_t with T(obs_{{t+1}}), target a_t",
+        flush=True,
+    )
     print(
         f"Rows -> parallel: {num_parallel_rows}, training_rows: {num_train_rows}, "
         f"speed_vocab={len(fac['speed_id_to_token'])} "

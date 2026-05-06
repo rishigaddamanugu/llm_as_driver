@@ -23,6 +23,12 @@ if TYPE_CHECKING:
 
 
 class StrictDistilledPolicy:
+    """Distilled policy with telemetry = human oracle for **o_{t+1}** (next observation).
+
+    Training pairs ``(o_t, T(obs_{t+1}), a_t)``. At rollout time ``o_{t+1}`` is unknown unless the
+    user provides an explicit instruction → feed neutral ``__UNK__`` factors (no peeking at current
+    vehicle state as a substitute for future oracle).
+    """
 
     def __init__(
         self,
@@ -175,17 +181,20 @@ class StrictDistilledPolicy:
         )
 
     def _resolve_factors(self, env: Any):
+        """T(obs_{t+1}) is unknown here → neutral __UNK__, unless user sets ``override_label``."""
+        if self._label_state is None:
+            return neutral_inference_telemetry_factors()
         ego = env.agent
         telemetry_tags = auto_label_telemetry(ego, None)
         auto_label = compact_telemetry_label_from_tags(telemetry_tags)
-        if self._label_state is not None:
-            self._label_state.last_auto_label = auto_label
-            self._label_state.last_error = None
-            if self._label_state.override_label is not None:
-                return factors_from_compact_label(self._label_state.override_label)
+        self._label_state.last_auto_label = auto_label
+        self._label_state.last_error = None
+        if self._label_state.override_label is not None:
+            return factors_from_compact_label(self._label_state.override_label)
         return neutral_inference_telemetry_factors()
 
     def action_for_env(self, env: Any) -> np.ndarray:
+        ego = env.agent
         factors = self._resolve_factors(env)
 
         _expert_action, expert_obs = self._expert.predict(

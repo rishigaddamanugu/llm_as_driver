@@ -118,3 +118,18 @@ NL_PRESETS: list[NlPreset] = [
         route_bin="b06",
     ),
 ]
+
+
+def nl_preset_to_compact_label(preset: NlPreset) -> str:
+    """Build the same compact string shape as `compact_telemetry_label_from_tags` / distillation."""
+    parts = [
+        f"speed_natural_language:{preset.speed}",
+        f"longitudinal_natural_language:{preset.longitudinal}",
+        f"steering_natural_language:{preset.steering}",
+    ]
+    if preset.overspeed:
+        parts.append("overspeed")
+    if preset.off_lane:
+        parts.append("off_lane")
+    parts.append(f"route_completion:{preset.route_bin}")
+    return "|".join(parts)

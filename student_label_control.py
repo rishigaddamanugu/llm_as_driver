@@ -132,21 +132,24 @@ def make_student_label_before_step(
 
 
 def student_mode_hud_text(*, state: StudentLabelState, file_trigger_hint: str = "") -> dict[str, str]:
-    mode = "OVERRIDE" if state.override_label is not None else "AUTO"
-    active_label = state.override_label if state.override_label is not None else state.last_auto_label
-    f = factors_from_compact_label(active_label or "")
-    lines = {
-        "Mode": mode,
-        "speed": f.speed,
-        "longitudinal": f.longitudinal,
-        "steering": f.steering,
-        "route_bin": f.route_bin,
-        "overspeed": "yes" if f.overspeed else "no",
-        "off_lane": "yes" if f.off_lane else "no",
-    }
-    if active_label:
-        lines["compact"] = _truncate(active_label, 96)
-    if file_trigger_hint:
+    if state.override_label is None:
+        lines = {
+            "Mode": "no user telemetry",
+            "model": "UNK factors until you set a label",
+        }
+    else:
+        f = factors_from_compact_label(state.override_label)
+        lines = {
+            "Mode": "user telemetry",
+            "speed": f.speed,
+            "longitudinal": f.longitudinal,
+            "steering": f.steering,
+            "route_bin": f.route_bin,
+            "overspeed": "yes" if f.overspeed else "no",
+            "off_lane": "yes" if f.off_lane else "no",
+            "compact": _truncate(state.override_label, 96),
+        }
+    if state.override_label is not None and file_trigger_hint:
         lines["Backup"] = f"touch {file_trigger_hint}"
     if state.last_error:
         lines["Note"] = _truncate(state.last_error, 48)
@@ -186,7 +189,7 @@ class StudentLabelHotkeys(DirectObject):
     def _clear(self) -> None:
         self._state.override_label = None
         self._state.last_error = None
-        print("[student] telemetry: AUTO (override cleared)", flush=True)
+        print("[student] user telemetry cleared (model uses neutral UNK factors)", flush=True)
 
     def _pin(self) -> None:
         auto = self._state.last_auto_label
@@ -221,9 +224,9 @@ def attach_student_label_hotkeys(
 
 def print_student_mode_key_help() -> None:
     print(
-        "\n--- Student mode: telemetry label overrides ---\n"
-        "  [     Back to live auto labels\n"
-        "  ;     Pin the **current** auto label (freeze)\n"
+        "\n--- Student mode: user telemetry ---\n"
+        "  [     Clear user telemetry (model uses neutral factors)\n"
+        "  ;     Pin **live scene** label from auto (then becomes user telemetry)\n"
         "  1-9   Apply configured preset strings (see APP_CONFIG student_label_presets)\n"
         "  Space / L  Label dialog (click the game window first, then press)\n",
         flush=True,

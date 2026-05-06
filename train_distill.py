@@ -11,6 +11,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader, Dataset
 
@@ -120,9 +121,9 @@ class DistillMLP(nn.Module):
         longitudinal_vocab_size: int,
         steering_vocab_size: int,
         route_bin_vocab_size: int,
-        telemetry_embed_dim: int = 64,
-        hidden_dim: int = 1024,
-        num_hidden_blocks: int = 6,
+        telemetry_embed_dim: int = 128,
+        hidden_dim: int = 2048,
+        num_hidden_blocks: int = 8,
         dropout: float = 0.0,
     ) -> None:
         super().__init__()
@@ -176,15 +177,12 @@ def _load_train_ready(path: Path) -> tuple[np.ndarray, dict[str, np.ndarray], np
     with np.load(path, allow_pickle=True) as data:
         obs = np.asarray(data["observation_input_time_t"], dtype=np.float32)
         telemetry_fields = {
-            "speed_id": np.asarray(data["telemetry_speed_id_t_plus_one"], dtype=np.int64),
-            "longitudinal_id": np.asarray(
-                data["telemetry_longitudinal_id_t_plus_one"],
-                dtype=np.int64,
-            ),
-            "steering_id": np.asarray(data["telemetry_steering_id_t_plus_one"], dtype=np.int64),
-            "route_bin_id": np.asarray(data["telemetry_route_bin_id_t_plus_one"], dtype=np.int64),
-            "overspeed": np.asarray(data["telemetry_overspeed_t_plus_one"], dtype=np.float32),
-            "off_lane": np.asarray(data["telemetry_off_lane_t_plus_one"], dtype=np.float32),
+            "speed_id": np.asarray(data["telemetry_speed_id"], dtype=np.int64),
+            "longitudinal_id": np.asarray(data["telemetry_longitudinal_id"], dtype=np.int64),
+            "steering_id": np.asarray(data["telemetry_steering_id"], dtype=np.int64),
+            "route_bin_id": np.asarray(data["telemetry_route_bin_id"], dtype=np.int64),
+            "overspeed": np.asarray(data["telemetry_overspeed"], dtype=np.float32),
+            "off_lane": np.asarray(data["telemetry_off_lane"], dtype=np.float32),
         }
         targets = np.asarray(data["expert_action_target_time_t"], dtype=np.float32)
         vocab_sizes = {
@@ -210,11 +208,31 @@ def _split_indices(n: int, val_ratio: float, seed: int) -> tuple[np.ndarray, np.
     return train_idx, val_idx
 
 
+def _distill_loss(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    loss_kind: str,
+    huber_beta: float,
+    w_steer: float,
+    w_tb: float,
+) -> torch.Tensor:
+    if loss_kind == "mse":
+        err = (pred - target) ** 2
+    else:
+        err = F.smooth_l1_loss(pred, target, reduction="none", beta=huber_beta)
+    return (err[:, 0] * w_steer + err[:, 1] * w_tb).mean()
+
+
 def _evaluate(
     model: nn.Module,
     loader: DataLoader,
-    criterion: nn.Module,
     device: torch.device,
+    *,
+    loss_kind: str,
+    huber_beta: float,
+    w_steer: float,
+    w_tb: float,
 ) -> float:
     model.eval()
     total_loss = 0.0
@@ -230,11 +248,31 @@ def _evaluate(
             off_lane = off_lane.to(device)
             targets = targets.to(device)
             pred = model(obs, speed_id, longitudinal_id, steering_id, route_bin_id, overspeed, off_lane)
-            loss = criterion(pred, targets)
+            loss = _distill_loss(
+                pred,
+                targets,
+                loss_kind=loss_kind,
+                huber_beta=huber_beta,
+                w_steer=w_steer,
+                w_tb=w_tb,
+            )
             batch_n = int(obs.shape[0])
             total_loss += float(loss.item()) * batch_n
             total += batch_n
     return total_loss / max(total, 1)
+
+
+def _print_train_ready_meta(path: Path) -> None:
+    try:
+        with np.load(path, allow_pickle=True) as z:
+            if "telemetry_align_mode" in z.files:
+                v = np.asarray(z["telemetry_align_mode"]).reshape(-1)[0]
+                print(f"train_ready telemetry_align_mode={v!s}", flush=True)
+            if "dataset_schema_description" in z.files:
+                d = np.asarray(z["dataset_schema_description"]).reshape(-1)[0]
+                print(f"train_ready schema: {d!s}", flush=True)
+    except Exception:
+        pass
 
 
 def main() -> None:
@@ -253,13 +291,13 @@ def main() -> None:
     out_metrics = out_dir / "distill_metrics.json"
 
     seed = _int_env("METADRIVE_DISTILL_SEED", 42)
-    batch_size = _int_env("METADRIVE_DISTILL_BATCH_SIZE", 256)
-    epochs = _int_env("METADRIVE_DISTILL_EPOCHS", 150)
+    batch_size = _int_env("METADRIVE_DISTILL_BATCH_SIZE", 4096)
+    epochs = _int_env("METADRIVE_DISTILL_EPOCHS", 500)
     lr = _float_env("METADRIVE_DISTILL_LR", 1e-3)
     val_ratio = _float_env("METADRIVE_DISTILL_VAL_RATIO", 0.1)
-    embed_dim = _int_env("METADRIVE_DISTILL_TELEMETRY_EMBED_DIM", 64)
-    hidden_dim = _int_env("METADRIVE_DISTILL_HIDDEN_DIM", 1024)
-    num_hidden_blocks = _int_env("METADRIVE_DISTILL_NUM_HIDDEN_BLOCKS", 6)
+    embed_dim = _int_env("METADRIVE_DISTILL_TELEMETRY_EMBED_DIM", 128)
+    hidden_dim = _int_env("METADRIVE_DISTILL_HIDDEN_DIM", 2048)
+    num_hidden_blocks = _int_env("METADRIVE_DISTILL_NUM_HIDDEN_BLOCKS", 8)
     dropout = _float_env("METADRIVE_DISTILL_DROPOUT", 0.15)
     weight_decay = _float_env("METADRIVE_DISTILL_WEIGHT_DECAY", 1e-4)
     grad_clip = _float_env("METADRIVE_DISTILL_GRAD_CLIP_NORM", 0.0)
@@ -271,6 +309,17 @@ def main() -> None:
         raise FileNotFoundError(
             f"Missing train-ready dataset: {data_path}. Run `python prepare_training_data.py` first."
         )
+
+    _print_train_ready_meta(data_path)
+
+    loss_raw = os.environ.get("METADRIVE_DISTILL_LOSS", "smooth_l1").strip().lower()
+    if loss_raw in ("mse", "l2"):
+        loss_kind = "mse"
+    else:
+        loss_kind = "smooth_l1"
+    huber_beta = _float_env("METADRIVE_DISTILL_HUBER_BETA", 0.05)
+    w_steer = _float_env("METADRIVE_DISTILL_WEIGHT_STEER", 1.0)
+    w_tb = _float_env("METADRIVE_DISTILL_WEIGHT_THROTTLE_BRAKE", 1.0)
 
     _set_seed(seed)
     obs, telemetry_fields, targets, vocab_sizes = _load_train_ready(data_path)
@@ -337,6 +386,11 @@ def main() -> None:
         f"plateau_scheduler={use_plateau} (patience={plateau_patience})",
         flush=True,
     )
+    print(
+        f"Loss: kind={loss_kind}  huber_beta={huber_beta}  "
+        f"w_steer={w_steer}  w_throttle_brake={w_tb}",
+        flush=True,
+    )
 
     model = DistillMLP(
         obs_dim=obs_dim,
@@ -349,7 +403,6 @@ def main() -> None:
         num_hidden_blocks=num_hidden_blocks,
         dropout=dropout,
     ).to(device)
-    criterion = nn.MSELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     scheduler: ReduceLROnPlateau | None = None
     if use_plateau:
@@ -396,7 +449,14 @@ def main() -> None:
                 batch_overspeed,
                 batch_off_lane,
             )
-            loss = criterion(pred, batch_targets)
+            loss = _distill_loss(
+                pred,
+                batch_targets,
+                loss_kind=loss_kind,
+                huber_beta=huber_beta,
+                w_steer=w_steer,
+                w_tb=w_tb,
+            )
             loss.backward()
             if grad_clip > 0:
                 nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
@@ -407,20 +467,30 @@ def main() -> None:
             seen += batch_n
 
         train_loss = running / max(seen, 1)
-        val_loss = _evaluate(model, val_loader, criterion, device)
+        val_loss = _evaluate(
+            model,
+            val_loader,
+            device,
+            loss_kind=loss_kind,
+            huber_beta=huber_beta,
+            w_steer=w_steer,
+            w_tb=w_tb,
+        )
         if scheduler is not None:
             scheduler.step(val_loss)
         lr_now = float(optimizer.param_groups[0]["lr"])
         history.append(
             {
                 "epoch": float(epoch),
+                "train_loss": float(train_loss),
+                "val_loss": float(val_loss),
                 "train_mse": float(train_loss),
                 "val_mse": float(val_loss),
                 "lr": lr_now,
             }
         )
         print(
-            f"epoch={epoch:03d} train_mse={train_loss:.6f} val_mse={val_loss:.6f} lr={lr_now:.2e}",
+            f"epoch={epoch:03d} train_loss={train_loss:.6f} val_loss={val_loss:.6f} lr={lr_now:.2e}",
             flush=True,
         )
 
@@ -438,6 +508,10 @@ def main() -> None:
                     "hidden_dim": hidden_dim,
                     "num_hidden_blocks": num_hidden_blocks,
                     "dropout": dropout,
+                    "loss_kind": loss_kind,
+                    "huber_beta": huber_beta,
+                    "weight_steer": w_steer,
+                    "weight_throttle_brake": w_tb,
                 },
                 out_model,
             )
@@ -453,6 +527,10 @@ def main() -> None:
         "hidden_dim": hidden_dim,
         "num_hidden_blocks": num_hidden_blocks,
         "dropout": dropout,
+        "loss_kind": loss_kind,
+        "huber_beta": huber_beta,
+        "weight_steer": w_steer,
+        "weight_throttle_brake": w_tb,
     }
     torch.save(_ckpt, out_model_last)
 
@@ -476,6 +554,11 @@ def main() -> None:
         "weight_decay": weight_decay,
         "grad_clip_norm": grad_clip,
         "use_plateau_scheduler": use_plateau,
+        "loss_kind": loss_kind,
+        "huber_beta": huber_beta,
+        "weight_steer": w_steer,
+        "weight_throttle_brake": w_tb,
+        "best_val_loss": float(best_val),
         "best_val_mse": float(best_val),
         "history": history,
         "checkpoint_path_best_val": str(out_model),

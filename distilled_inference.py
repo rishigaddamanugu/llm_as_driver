@@ -10,7 +10,11 @@ import numpy as np
 import torch
 
 from expert_model import BundledExpert
-from telemetry_factorization import encode_with_vocab, factors_from_compact_label, factors_from_tags
+from telemetry_factorization import (
+    encode_with_vocab,
+    factors_from_compact_label,
+    neutral_inference_telemetry_factors,
+)
 from telemetry_labels import auto_label_telemetry, compact_telemetry_label_from_tags
 from train_distill import DistillMLP
 
@@ -170,27 +174,19 @@ class StrictDistilledPolicy:
             label_state=label_state,
         )
 
-    def action_for_env(self, env: Any) -> np.ndarray:
+    def _resolve_factors(self, env: Any):
         ego = env.agent
         telemetry_tags = auto_label_telemetry(ego, None)
         auto_label = compact_telemetry_label_from_tags(telemetry_tags)
         if self._label_state is not None:
             self._label_state.last_auto_label = auto_label
-            label = (
-                self._label_state.override_label
-                if self._label_state.override_label is not None
-                else auto_label
-            )
-        else:
-            label = auto_label
-
-        factors = (
-            factors_from_compact_label(label)
-            if (self._label_state is not None and self._label_state.override_label is not None)
-            else factors_from_tags(telemetry_tags)
-        )
-        if self._label_state is not None:
             self._label_state.last_error = None
+            if self._label_state.override_label is not None:
+                return factors_from_compact_label(self._label_state.override_label)
+        return neutral_inference_telemetry_factors()
+
+    def action_for_env(self, env: Any) -> np.ndarray:
+        factors = self._resolve_factors(env)
 
         _expert_action, expert_obs = self._expert.predict(
             ego,

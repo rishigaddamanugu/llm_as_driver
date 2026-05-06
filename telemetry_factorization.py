@@ -19,12 +19,25 @@ class TelemetryFactors:
     route_bin: str
 
 
+def neutral_inference_telemetry_factors() -> TelemetryFactors:
+    return TelemetryFactors(
+        speed=_UNK,
+        longitudinal=_UNK,
+        steering=_UNK,
+        overspeed=0,
+        off_lane=0,
+        route_bin=_UNK,
+    )
+
+
 def _norm_phrase(v: str) -> str:
     return str(v or "").strip() or _UNK
 
 
 def _norm_route_bin(v: str) -> str:
     raw = str(v or "").strip()
+    if raw == _UNK:
+        return _UNK
     if raw.startswith("b") and raw[1:].isdigit():
         return f"b{int(raw[1:]):02d}"
     try:

@@ -82,6 +82,25 @@ def _factorize_telemetry_labels(telemetry_labels: np.ndarray) -> dict[str, objec
     }
 
 
+def _build_aligned_training_dataset(
+    expert_observations: np.ndarray,
+    expert_actions: np.ndarray,
+    telemetry_labels_T_at_same_timestep_as_observation: np.ndarray,
+) -> dict[str, np.ndarray]:
+    n = int(expert_observations.shape[0])
+    if n < 1:
+        raise ValueError("Need at least 1 timestep.")
+    if expert_actions.shape[0] != n:
+        raise ValueError("expert_observations and expert_actions length mismatch.")
+    if telemetry_labels_T_at_same_timestep_as_observation.shape[0] != n:
+        raise ValueError("expert_observations and telemetry_labels length mismatch.")
+    return {
+        "observation_input_time_t": expert_observations.copy(),
+        "telemetry_label_same_timestep_as_observation": telemetry_labels_T_at_same_timestep_as_observation.copy(),
+        "expert_action_target_time_t": expert_actions.copy(),
+    }
+
+
 def _build_offset_training_dataset(
     expert_observations: np.ndarray,
     expert_actions: np.ndarray,
@@ -136,43 +155,54 @@ def main() -> None:
         )
 
     expert_observations, expert_actions, telemetry_labels = _concat_parallel_arrays(source_paths)
-    offset = _build_offset_training_dataset(
-        expert_observations,
-        expert_actions,
-        telemetry_labels,
-    )
+    align = os.environ.get(
+        "METADRIVE_TRAIN_TELEMETRY_ALIGN",
+        "obs_t_telem_t_plus_1",
+    ).strip().lower()
+    if align in ("same", "aligned", "same_timestep"):
+        offset = _build_aligned_training_dataset(
+            expert_observations,
+            expert_actions,
+            telemetry_labels,
+        )
+        telemetry_selected = offset["telemetry_label_same_timestep_as_observation"]
+        schema_txt = (
+            "input: o_t + T_t (same index); target: a_t"
+        )
+    else:
+        offset = _build_offset_training_dataset(
+            expert_observations,
+            expert_actions,
+            telemetry_labels,
+        )
+        telemetry_selected = offset["telemetry_label_T_observation_time_t_plus_one"]
+        schema_txt = "input: o_t + T_{t+1}; target: a_t"
 
-    telemetry_next = offset["telemetry_label_T_observation_time_t_plus_one"]
-    fac = _factorize_telemetry_labels(telemetry_next)
+    fac = _factorize_telemetry_labels(telemetry_selected)
+
+    pack: dict[str, object] = {
+        "expert_observations": expert_observations,
+        "expert_actions": expert_actions,
+        "telemetry_labels_T_at_same_timestep_as_observation": telemetry_labels,
+        "observation_input_time_t": offset["observation_input_time_t"],
+        "telemetry_label_selected": telemetry_selected,
+        "telemetry_speed_id": fac["telemetry_speed_id"],
+        "telemetry_longitudinal_id": fac["telemetry_longitudinal_id"],
+        "telemetry_steering_id": fac["telemetry_steering_id"],
+        "telemetry_route_bin_id": fac["telemetry_route_bin_id"],
+        "telemetry_overspeed": fac["telemetry_overspeed"],
+        "telemetry_off_lane": fac["telemetry_off_lane"],
+        "expert_action_target_time_t": offset["expert_action_target_time_t"],
+        "telemetry_speed_vocab": np.asarray(fac["speed_id_to_token"], dtype=object),
+        "telemetry_longitudinal_vocab": np.asarray(fac["longitudinal_id_to_token"], dtype=object),
+        "telemetry_steering_vocab": np.asarray(fac["steering_id_to_token"], dtype=object),
+        "telemetry_route_bin_vocab": np.asarray(fac["route_bin_id_to_token"], dtype=object),
+        "dataset_schema_description": np.array(schema_txt, dtype=object),
+        "telemetry_align_mode": np.array(align, dtype=object),
+    }
 
     out_npz.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(
-        out_npz,
-
-        expert_observations=expert_observations,
-        expert_actions=expert_actions,
-        telemetry_labels_T_at_same_timestep_as_observation=telemetry_labels,
-
-        observation_input_time_t=offset["observation_input_time_t"],
-        telemetry_label_T_observation_time_t_plus_one=telemetry_next,
-        telemetry_speed_id_t_plus_one=fac["telemetry_speed_id"],
-        telemetry_longitudinal_id_t_plus_one=fac["telemetry_longitudinal_id"],
-        telemetry_steering_id_t_plus_one=fac["telemetry_steering_id"],
-        telemetry_route_bin_id_t_plus_one=fac["telemetry_route_bin_id"],
-        telemetry_overspeed_t_plus_one=fac["telemetry_overspeed"],
-        telemetry_off_lane_t_plus_one=fac["telemetry_off_lane"],
-        expert_action_target_time_t=offset["expert_action_target_time_t"],
-
-        telemetry_speed_vocab=np.asarray(fac["speed_id_to_token"], dtype=object),
-        telemetry_longitudinal_vocab=np.asarray(fac["longitudinal_id_to_token"], dtype=object),
-        telemetry_steering_vocab=np.asarray(fac["steering_id_to_token"], dtype=object),
-        telemetry_route_bin_vocab=np.asarray(fac["route_bin_id_to_token"], dtype=object),
-        dataset_schema_description=np.array(
-            "input: observation_input_time_t + factorized telemetry ids/flags at t+1; "
-            "target: expert_action_target_time_t",
-            dtype=object,
-        ),
-    )
+    np.savez_compressed(out_npz, **pack)
 
     out_vocab.write_text(
         json.dumps(
@@ -198,7 +228,7 @@ def main() -> None:
     print(f"Wrote train dataset: {out_npz}", flush=True)
     print(f"Wrote telemetry vocab: {out_vocab}", flush=True)
     print(
-        f"Rows -> parallel: {num_parallel_rows}, training(offset): {num_train_rows}, "
+        f"Rows -> parallel: {num_parallel_rows}, training_rows: {num_train_rows}, "
         f"speed_vocab={len(fac['speed_id_to_token'])} "
         f"long_vocab={len(fac['longitudinal_id_to_token'])} "
         f"steer_vocab={len(fac['steering_id_to_token'])} "
